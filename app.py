@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -40,21 +40,18 @@ PAIRS = {
     "EURUSD": {
         "ticker": "EURUSD=X",
         "pip": 0.0001,
-        "contract": 100000,
         "decimals": 5,
         "default": 1.10000,
     },
     "XAUUSD": {
         "ticker": "GC=F",
         "pip": 0.01,
-        "contract": 100,
         "decimals": 2,
         "default": 2350.00,
     },
     "BTCUSD": {
         "ticker": "BTC-USD",
         "pip": 1.0,
-        "contract": 1,
         "decimals": 2,
         "default": 78000.00,
     },
@@ -71,68 +68,34 @@ RR_OPTIONS = {
     "1:4": 4.0,
 }
 
+SIGNAL_INTERVALS = {
+    "15 minutes": 15,
+    "30 minutes": 30,
+    "1 hour": 60,
+    "2 hours": 120,
+    "3 hours": 180,
+}
+
 BUY_BG = "#dcfce7"
 SELL_BG = "#fee2e2"
 NEUTRAL_BG = "#ffedd5"
 
 
 # =====================================================
-# CSS
+# HELPERS
 # =====================================================
 
-st.markdown(
-    """
-<style>
-.block-container {
-    padding-top: 1.2rem;
-}
-.main-title {
-    font-size: 34px;
-    font-weight: 900;
-    color: #0f172a;
-    margin-bottom: 0.15rem;
-}
-.subtitle {
-    color: #64748b;
-    font-size: 15px;
-    margin-bottom: 1rem;
-}
-.card {
-    background: white;
-    border: 1px solid #e5e7eb;
-    border-radius: 20px;
-    padding: 18px;
-    box-shadow: 0 8px 24px rgba(15,23,42,0.06);
-    margin-bottom: 14px;
-}
-.stButton > button {
-    border-radius: 12px;
-    font-weight: 700;
-}
-</style>
-""",
-    unsafe_allow_html=True,
-)
+def get_secret_value(name, default=""):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
 
-
-# =====================================================
-# BASIC HELPERS
-# =====================================================
 
 def fmt_price(market, value):
     if value is None or pd.isna(value):
         return "N/A"
     return f"{float(value):.{PAIRS[market]['decimals']}f}"
-
-
-def price_step(market):
-    if market == "BTCUSD":
-        return 1.0
-    if market == "XAUUSD":
-        return 0.01
-    if "JPY" in market:
-        return 0.01
-    return 0.0001
 
 
 def color_rows(df):
@@ -151,11 +114,15 @@ def color_rows(df):
     return df.style.apply(apply, axis=1)
 
 
+def safe_timestamp():
+    return pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 # =====================================================
 # MARKET DATA
 # =====================================================
 
-@st.cache_data(ttl=90)
+@st.cache_data(ttl=120)
 def get_live_price(market):
     fallback = PAIRS[market]["default"]
     ticker = PAIRS[market]["ticker"]
@@ -177,7 +144,14 @@ def get_live_price(market):
         pass
 
     try:
-        raw = yf.download(ticker, period="5d", interval="1d", progress=False, auto_adjust=False)
+        raw = yf.download(
+            ticker,
+            period="5d",
+            interval="1d",
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+        )
 
         if raw is not None and not raw.empty:
             if isinstance(raw.columns, pd.MultiIndex):
@@ -228,9 +202,30 @@ def clean_data(raw):
 def load_market_data(market, daily_start):
     ticker = PAIRS[market]["ticker"]
 
-    daily_raw = yf.download(ticker, start=daily_start, interval="1d", progress=False, auto_adjust=False)
-    h1_raw = yf.download(ticker, period="730d", interval="1h", progress=False, auto_adjust=False)
-    m15_raw = yf.download(ticker, period="60d", interval="15m", progress=False, auto_adjust=False)
+    daily_raw = yf.download(
+        ticker,
+        start=daily_start,
+        interval="1d",
+        progress=False,
+        auto_adjust=False,
+        threads=False,
+    )
+    h1_raw = yf.download(
+        ticker,
+        period="730d",
+        interval="1h",
+        progress=False,
+        auto_adjust=False,
+        threads=False,
+    )
+    m15_raw = yf.download(
+        ticker,
+        period="60d",
+        interval="15m",
+        progress=False,
+        auto_adjust=False,
+        threads=False,
+    )
 
     return clean_data(daily_raw), clean_data(h1_raw), clean_data(m15_raw)
 
@@ -423,7 +418,7 @@ def build_fx15_strategy(daily, h1, m15, rr, atr_mult, start_hour, end_hour, enfo
 
 
 # =====================================================
-# STRATEGY: SMC MARKET STRUCTURE
+# STRATEGY: SMC
 # =====================================================
 
 def add_swings(df, n):
@@ -588,21 +583,21 @@ def load_telegram_sent_log():
         try:
             return pd.read_csv(TELEGRAM_SENT_LOG_FILE)
         except Exception:
-            return pd.DataFrame(columns=["Signal_ID", "Timestamp", "Strategy", "Market", "Direction", "Message"])
-    return pd.DataFrame(columns=["Signal_ID", "Timestamp", "Strategy", "Market", "Direction", "Message"])
+            return pd.DataFrame(
+                columns=["Signal_Key", "Signal_ID", "Timestamp", "Strategy", "Market", "Direction", "Message"]
+            )
+    return pd.DataFrame(columns=["Signal_Key", "Signal_ID", "Timestamp", "Strategy", "Market", "Direction", "Message"])
 
 
-def save_telegram_sent_signal(signal_id, strategy, market, direction, message):
+def save_telegram_sent_signal(signal_key, signal_id, strategy, market, direction, message):
     log = load_telegram_sent_log()
-
-    if "Signal_ID" in log.columns and signal_id in set(log["Signal_ID"].astype(str)):
-        return
 
     new_row = pd.DataFrame(
         [
             {
+                "Signal_Key": signal_key,
                 "Signal_ID": signal_id,
-                "Timestamp": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "Timestamp": safe_timestamp(),
                 "Strategy": strategy,
                 "Market": market,
                 "Direction": direction,
@@ -615,25 +610,47 @@ def save_telegram_sent_signal(signal_id, strategy, market, direction, message):
     log.to_csv(TELEGRAM_SENT_LOG_FILE, index=False)
 
 
-def already_sent_telegram_signal(signal_id):
-    log = load_telegram_sent_log()
-
-    if log.empty or "Signal_ID" not in log.columns:
-        return False
-
-    return signal_id in set(log["Signal_ID"].astype(str))
-
-
 def clear_telegram_sent_log():
     if TELEGRAM_SENT_LOG_FILE.exists():
         TELEGRAM_SENT_LOG_FILE.unlink()
 
 
-def make_telegram_signal_id(strategy, market, direction, entry, sl, tp, source_time=""):
+def make_signal_key(strategy, market, direction):
+    return f"{strategy}|{market}|{direction}"
+
+
+def make_signal_id(strategy, market, direction, entry, sl, tp, source_time=""):
     return (
-        f"TG|{strategy}|{market}|{direction}|"
+        f"{strategy}|{market}|{direction}|"
         f"{round(float(entry), 8)}|{round(float(sl), 8)}|{round(float(tp), 8)}|{source_time}"
     )
+
+
+def signal_is_in_cooldown(signal_key, cooldown_minutes):
+    log = load_telegram_sent_log()
+
+    if log.empty or "Signal_Key" not in log.columns:
+        return False, "No previous alert"
+
+    related = log[log["Signal_Key"].astype(str) == str(signal_key)].copy()
+
+    if related.empty:
+        return False, "No previous alert for this market/direction"
+
+    related["Timestamp_dt"] = pd.to_datetime(related["Timestamp"], errors="coerce")
+    related = related.dropna(subset=["Timestamp_dt"])
+
+    if related.empty:
+        return False, "No valid timestamp"
+
+    last_time = related["Timestamp_dt"].max()
+    minutes_since = (pd.Timestamp.now() - last_time).total_seconds() / 60
+
+    if minutes_since < cooldown_minutes:
+        remaining = cooldown_minutes - minutes_since
+        return True, f"Cooldown active. Next alert allowed in about {remaining:.1f} minutes."
+
+    return False, f"Cooldown passed. Last alert was {minutes_since:.1f} minutes ago."
 
 
 def send_telegram_message(bot_token, chat_id, message):
@@ -702,7 +719,7 @@ def format_telegram_signal_message(strategy, market, direction, entry, sl, tp, r
 # SCANNER
 # =====================================================
 
-def build_strategy_for_market(scan_market, selected_strategy, daily_start, rr_ratio, atr_mult, swing_len, strict_mode, session_start, session_end, enforce_session):
+def build_strategy_for_market(scan_market, selected_strategy, daily_start, rr_ratio, atr_mult, swing_len, strict_mode, session_start, session_end, enforce_window):
     d_daily, d_h1, d_m15_raw = load_market_data(scan_market, str(daily_start))
 
     if d_daily.empty or d_h1.empty or d_m15_raw.empty:
@@ -719,7 +736,7 @@ def build_strategy_for_market(scan_market, selected_strategy, daily_start, rr_ra
             strict_mode,
             session_start,
             session_end,
-            enforce_session,
+            enforce_window,
         )
     else:
         d_daily, d_h1, d_m15 = build_fx15_strategy(
@@ -730,7 +747,7 @@ def build_strategy_for_market(scan_market, selected_strategy, daily_start, rr_ra
             atr_mult,
             session_start,
             session_end,
-            enforce_session,
+            enforce_window,
         )
 
     valid = d_m15.dropna(subset=["Close"])
@@ -739,7 +756,7 @@ def build_strategy_for_market(scan_market, selected_strategy, daily_start, rr_ra
     return d_daily, d_h1, d_m15, latest_row, None
 
 
-def scan_all_markets(selected_strategy, daily_start, rr_ratio, atr_mult, swing_len, strict_mode, session_start, session_end, enforce_session):
+def scan_all_markets(selected_strategy, daily_start, rr_ratio, atr_mult, swing_len, strict_mode, session_start, session_end, enforce_window):
     rows = []
     cache = {}
 
@@ -755,7 +772,7 @@ def scan_all_markets(selected_strategy, daily_start, rr_ratio, atr_mult, swing_l
                 strict_mode,
                 session_start,
                 session_end,
-                enforce_session,
+                enforce_window,
             )
 
             cache[scan_market] = {"daily": d_daily, "h1": d_h1, "m15": d_m15, "latest": latest_row, "error": err}
@@ -812,7 +829,7 @@ def scan_all_markets(selected_strategy, daily_start, rr_ratio, atr_mult, swing_l
     return pd.DataFrame(rows), cache
 
 
-def send_scanner_telegram_alerts(scanner_df, strategy, risk_percent, rr_label, bot_token, chat_id, enable_telegram, auto_send):
+def send_scanner_telegram_alerts(scanner_df, strategy, risk_percent, rr_label, bot_token, chat_id, enable_telegram, auto_send, cooldown_minutes):
     statuses = []
 
     if not enable_telegram or not auto_send:
@@ -838,10 +855,13 @@ def send_scanner_telegram_alerts(scanner_df, strategy, risk_percent, rr_label, b
             statuses.append(f"{market}: skipped because Entry/SL/TP is missing.")
             continue
 
-        signal_id = make_telegram_signal_id(strategy, market, direction, entry, sl, tp, cameroon_time)
+        signal_key = make_signal_key(strategy, market, direction)
+        signal_id = make_signal_id(strategy, market, direction, entry, sl, tp, cameroon_time)
 
-        if already_sent_telegram_signal(signal_id):
-            statuses.append(f"{market}: duplicate Telegram signal skipped.")
+        in_cooldown, cooldown_message = signal_is_in_cooldown(signal_key, cooldown_minutes)
+
+        if in_cooldown:
+            statuses.append(f"{market}: {cooldown_message}")
             continue
 
         message = format_telegram_signal_message(
@@ -860,7 +880,7 @@ def send_scanner_telegram_alerts(scanner_df, strategy, risk_percent, rr_label, b
         ok, response = send_telegram_message(bot_token, chat_id, message)
 
         if ok:
-            save_telegram_sent_signal(signal_id, strategy, market, direction, response)
+            save_telegram_sent_signal(signal_key, signal_id, strategy, market, direction, response)
 
         statuses.append(f"{market}: {response}")
 
@@ -922,11 +942,8 @@ def candle_chart(df, title):
 # APP
 # =====================================================
 
-st.markdown('<div class="main-title">📡 Telegram Trading Signal Scanner</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="subtitle">Streamlit Cloud friendly scanner for EURUSD, XAUUSD, and BTCUSD. No MT5. No trade execution. Telegram signals only.</div>',
-    unsafe_allow_html=True,
-)
+st.title("📡 Telegram Trading Signal Scanner")
+st.caption("Streamlit Cloud friendly scanner for EURUSD, XAUUSD, and BTCUSD. No MT5. No trade execution. Telegram signals only.")
 
 with st.sidebar:
     st.header("Scanner Controls")
@@ -938,13 +955,21 @@ with st.sidebar:
     )
 
     chart_market = st.selectbox("Chart market", SCAN_MARKETS, index=0)
-    daily_start = st.date_input("Daily data start", value=pd.to_datetime("2020-01-01"))
+    data_start_year = st.selectbox("Daily data start year", [2018, 2019, 2020, 2021, 2022, 2023], index=2)
+    daily_start = f"{data_start_year}-01-01"
 
     st.divider()
     st.subheader("Risk Display")
     risk_percent = st.selectbox("Risk % displayed in alerts", [0.25, 0.5, 1.0, 1.5, 2.0], index=2)
     rr_label = st.selectbox("Risk Reward", list(RR_OPTIONS.keys()), index=2)
     rr_ratio = RR_OPTIONS[rr_label]
+
+    signal_interval_label = st.selectbox(
+        "Minimum interval between signals",
+        list(SIGNAL_INTERVALS.keys()),
+        index=1,
+    )
+    signal_cooldown_minutes = SIGNAL_INTERVALS[signal_interval_label]
 
     st.divider()
     st.subheader("Strategy Settings")
@@ -964,15 +989,13 @@ with st.sidebar:
     enable_telegram = st.checkbox("Enable Telegram alerts", value=True)
     auto_send_telegram = st.checkbox("Auto-send BUY/SELL signals to Telegram", value=True)
 
-    try:
-        default_bot = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
-        default_chat = st.secrets.get("TELEGRAM_CHAT_ID", "")
-    except Exception:
-        default_bot = ""
-        default_chat = ""
+    bot_token = get_secret_value("TELEGRAM_BOT_TOKEN", "")
+    chat_id = get_secret_value("TELEGRAM_CHAT_ID", "")
 
-    bot_token = st.text_input("Telegram BOT_TOKEN", value=default_bot, type="password")
-    chat_id = st.text_input("Telegram CHAT_ID", value=default_chat)
+    if bot_token and chat_id:
+        st.success("Telegram secrets loaded.")
+    else:
+        st.warning("Telegram secrets are missing. Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Streamlit Secrets.")
 
     if st.button("Send Telegram Test Message"):
         ok, msg = send_telegram_message(bot_token, chat_id, "✅ Telegram test from Streamlit Trading Signal Scanner.")
@@ -1005,12 +1028,20 @@ with st.sidebar:
         st.rerun()
 
 
-# Live prices
-live_cols = st.columns(3)
-for idx, market in enumerate(SCAN_MARKETS):
+# Live prices without st.metric to avoid cloud chunk loading issues
+st.subheader("Live Prices")
+price_rows = []
+for market in SCAN_MARKETS:
     price, source = get_live_price(market)
-    live_cols[idx].metric(f"{market} live price", fmt_price(market, price))
-    live_cols[idx].caption(source)
+    price_rows.append(
+        {
+            "Market": market,
+            "Live Price": fmt_price(market, price),
+            "Source": source,
+        }
+    )
+st.dataframe(pd.DataFrame(price_rows), use_container_width=True)
+
 
 # Scan all markets
 scanner_df, scanner_cache = scan_all_markets(
@@ -1022,7 +1053,7 @@ scanner_df, scanner_cache = scan_all_markets(
     strict_mode=strict_mode,
     session_start=session_start,
     session_end=session_end,
-    enforce_session=enforce_session,
+    enforce_window=enforce_session,
 )
 
 telegram_statuses = send_scanner_telegram_alerts(
@@ -1034,21 +1065,31 @@ telegram_statuses = send_scanner_telegram_alerts(
     chat_id=chat_id,
     enable_telegram=enable_telegram,
     auto_send=auto_send_telegram,
+    cooldown_minutes=signal_cooldown_minutes,
 )
+
 
 # Dashboard
 st.subheader("All-Pair Signal Scanner")
-st.caption("The app scans EURUSD, XAUUSD, and BTCUSD after every refresh. It sends Telegram alerts only for active BUY/SELL signals.")
+st.caption(
+    f"The app scans EURUSD, XAUUSD, and BTCUSD after every refresh. Minimum interval between alerts: {signal_interval_label}."
+)
 
 if scanner_df.empty:
     st.info("Scanner has no data yet.")
 else:
     display_df = scanner_df.copy()
+
     for col in ["Entry", "SL", "TP"]:
-        display_df[col] = display_df.apply(lambda r: fmt_price(r["Market"], r[col]) if pd.notna(r[col]) else "N/A", axis=1)
+        display_df[col] = display_df.apply(
+            lambda r: fmt_price(r["Market"], r[col]) if pd.notna(r[col]) else "N/A",
+            axis=1,
+        )
+
     st.dataframe(color_rows(display_df), use_container_width=True)
 
 active = scanner_df[scanner_df["Signal"].isin(["BUY", "SELL"])]
+
 if active.empty:
     st.info("No active BUY/SELL signals right now.")
 else:
