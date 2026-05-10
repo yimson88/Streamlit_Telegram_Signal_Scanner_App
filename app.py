@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -116,6 +116,64 @@ def color_rows(df):
 
 def safe_timestamp():
     return pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def current_utc_time():
+    return pd.Timestamp.now(tz="UTC")
+
+
+def is_market_open(market, now_utc=None):
+    """
+    BTCUSD trades 24/7.
+    EURUSD and XAUUSD are blocked during weekend closure.
+    Approximation: Sunday 22:00 UTC to Friday 22:00 UTC.
+    """
+    if now_utc is None:
+        now_utc = current_utc_time()
+
+    if market == "BTCUSD":
+        return True, "OPEN"
+
+    weekday = now_utc.weekday()  # Monday=0, Sunday=6
+    hour = now_utc.hour + now_utc.minute / 60
+
+    if weekday == 5:
+        return False, "CLOSED_WEEKEND"
+    if weekday == 6 and hour < 22:
+        return False, "CLOSED_WEEKEND"
+    if weekday == 4 and hour >= 22:
+        return False, "CLOSED_WEEKEND"
+
+    return True, "OPEN"
+
+
+def candle_age_minutes(candle_time):
+    try:
+        candle_ts = pd.Timestamp(candle_time)
+        if candle_ts.tzinfo is None:
+            candle_ts = candle_ts.tz_localize("UTC")
+        else:
+            candle_ts = candle_ts.tz_convert("UTC")
+        return round((current_utc_time() - candle_ts).total_seconds() / 60, 1)
+    except Exception:
+        return np.nan
+
+
+def is_fresh_signal_candle(candle_time, max_age_minutes):
+    age = candle_age_minutes(candle_time)
+    if pd.isna(age):
+        return False, age, "UNKNOWN_CANDLE_TIME"
+    if age > max_age_minutes:
+        return False, age, f"STALE_CANDLE_{age:.1f}_MIN"
+    return True, age, "FRESH_CANDLE"
+
+
+def already_sent_exact_signal(signal_id):
+    log = load_telegram_sent_log()
+    if log.empty or "Signal_ID" not in log.columns:
+        return False
+    return str(signal_id) in set(log["Signal_ID"].astype(str))
+
 
 
 # =====================================================
@@ -789,7 +847,7 @@ def build_strategy_for_market(scan_market, selected_strategy, daily_start, rr_ra
     return d_daily, d_h1, d_m15, latest_row, None
 
 
-def scan_all_markets(selected_strategy, daily_start, rr_ratio, atr_mult, swing_len, strict_mode, session_start, session_end, enforce_window, scan_speed='Fast'):
+def scan_all_markets(selected_strategy, daily_start, rr_ratio, atr_mult, swing_len, strict_mode, session_start, session_end, enforce_window, scan_speed='Fast', block_closed_markets=True, max_signal_age_minutes=90):
     rows = []
     cache = {}
 
@@ -823,23 +881,48 @@ def scan_all_markets(selected_strategy, daily_start, rr_ratio, atr_mult, swing_l
                         "TP": np.nan,
                         "Cameroon_Time": "N/A",
                         "Trading_Window": False,
+                        "Market_Status": is_market_open(scan_market)[1],
+                        "Candle_Age_Min": np.nan,
+                        "Freshness": "NO_CANDLE",
                         "Reason": err or "No latest candle",
                     }
                 )
                 continue
 
+            market_open, market_status = is_market_open(scan_market)
+            fresh_ok, age_min, fresh_status = is_fresh_signal_candle(
+                latest_row.get("Date", None),
+                max_signal_age_minutes,
+            )
+
+            signal_value = latest_row.get("Signal", "NEUTRAL")
+            direction_value = latest_row.get("Direction", "NEUTRAL")
+            reason_value = latest_row.get("Reason", "")
+
+            if block_closed_markets and not market_open:
+                signal_value = "NEUTRAL"
+                direction_value = "NEUTRAL"
+                reason_value = f"Market closed: {market_status}. Last setup ignored until market reopens."
+            elif not fresh_ok:
+                signal_value = "NEUTRAL"
+                direction_value = "NEUTRAL"
+                reason_value = f"Stale candle ignored: {fresh_status}."
+
             rows.append(
                 {
                     "Market": scan_market,
                     "Strategy": selected_strategy,
-                    "Signal": latest_row.get("Signal", "NEUTRAL"),
-                    "Direction": latest_row.get("Direction", "NEUTRAL"),
+                    "Signal": signal_value,
+                    "Direction": direction_value,
                     "Entry": latest_row.get("Entry", np.nan),
                     "SL": latest_row.get("SL", np.nan),
                     "TP": latest_row.get("TP", np.nan),
                     "Cameroon_Time": latest_row.get("Cameroon_Time", "N/A"),
                     "Trading_Window": bool(latest_row.get("Trading_Window", False)),
-                    "Reason": latest_row.get("Reason", ""),
+                    "Market_Status": market_status,
+                    "Candle_Age_Min": age_min,
+                    "Freshness": fresh_status,
+                    "Reason": reason_value,
                 }
             )
 
@@ -856,6 +939,9 @@ def scan_all_markets(selected_strategy, daily_start, rr_ratio, atr_mult, swing_l
                     "TP": np.nan,
                     "Cameroon_Time": "N/A",
                     "Trading_Window": False,
+                    "Market_Status": is_market_open(scan_market)[1],
+                    "Candle_Age_Min": np.nan,
+                    "Freshness": "ERROR",
                     "Reason": str(e),
                 }
             )
@@ -863,7 +949,7 @@ def scan_all_markets(selected_strategy, daily_start, rr_ratio, atr_mult, swing_l
     return pd.DataFrame(rows), cache
 
 
-def send_scanner_telegram_alerts(scanner_df, strategy, risk_percent, rr_label, bot_token, chat_id, enable_telegram, auto_send, cooldown_minutes):
+def send_scanner_telegram_alerts(scanner_df, strategy, risk_percent, rr_label, bot_token, chat_id, enable_telegram, auto_send, cooldown_minutes, block_closed_markets=True, max_signal_age_minutes=90):
     statuses = []
 
     if not enable_telegram or not auto_send:
@@ -889,8 +975,23 @@ def send_scanner_telegram_alerts(scanner_df, strategy, risk_percent, rr_label, b
             statuses.append(f"{market}: skipped because Entry/SL/TP is missing.")
             continue
 
+        market_open, market_status = is_market_open(market)
+        if block_closed_markets and not market_open:
+            statuses.append(f"{market}: market is closed ({market_status}); alert skipped.")
+            continue
+
+        freshness_status = str(row.get("Freshness", ""))
+        candle_age = row.get("Candle_Age_Min", np.nan)
+        if freshness_status.startswith("STALE") or (pd.notna(candle_age) and float(candle_age) > max_signal_age_minutes):
+            statuses.append(f"{market}: stale candle alert skipped. Age: {candle_age} minutes.")
+            continue
+
         signal_key = make_signal_key(strategy, market, direction)
         signal_id = make_signal_id(strategy, market, direction, entry, sl, tp, cameroon_time)
+
+        if already_sent_exact_signal(signal_id):
+            statuses.append(f"{market}: exact same candle signal already sent; skipped.")
+            continue
 
         in_cooldown, cooldown_message = signal_is_in_cooldown(signal_key, cooldown_minutes)
 
@@ -1015,6 +1116,10 @@ with st.sidebar:
     )
     signal_cooldown_minutes = SIGNAL_INTERVALS[signal_interval_label]
 
+    block_closed_markets = st.checkbox("Block alerts when market is closed", value=True)
+    max_signal_age_minutes = st.selectbox("Maximum signal candle age", [30, 60, 90, 120, 180], index=2)
+    st.caption("This prevents old Gold/Forex signals from repeating during weekend or market closure.")
+
     st.divider()
     st.subheader("Strategy Settings")
     atr_mult = st.selectbox("ATR safety buffer", [0.5, 1.0, 1.5, 2.0], index=1)
@@ -1084,6 +1189,8 @@ scanner_df, scanner_cache = scan_all_markets(
     session_end=session_end,
     enforce_window=enforce_session,
     scan_speed=scan_speed,
+    block_closed_markets=block_closed_markets,
+    max_signal_age_minutes=max_signal_age_minutes,
 )
 
 
@@ -1114,13 +1221,15 @@ telegram_statuses = send_scanner_telegram_alerts(
     enable_telegram=enable_telegram,
     auto_send=auto_send_telegram,
     cooldown_minutes=signal_cooldown_minutes,
+    block_closed_markets=block_closed_markets,
+    max_signal_age_minutes=max_signal_age_minutes,
 )
 
 
 # Dashboard
 st.subheader("All-Pair Signal Scanner")
 st.caption(
-    f"The app scans EURUSD, XAUUSD, and BTCUSD after every refresh. Minimum interval between alerts: {signal_interval_label}."
+    f"The app scans EURUSD, XAUUSD, and BTCUSD after every refresh. Minimum interval between alerts: {signal_interval_label}. Closed-market and stale-candle filters are active."
 )
 
 if scanner_df.empty:
