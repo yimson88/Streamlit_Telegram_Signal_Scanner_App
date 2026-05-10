@@ -199,36 +199,69 @@ def clean_data(raw):
 
 
 @st.cache_data(ttl=600)
-def load_market_data(market, daily_start):
+def load_market_data(market, daily_start, scan_speed="Fast"):
+    """
+    Cloud-safe market data loader.
+
+    Fast mode keeps the app responsive on Streamlit Cloud:
+    - Daily: 18 months
+    - H1: 90 days
+    - M15: 10 days
+
+    Balanced mode:
+    - Daily: 2 years
+    - H1: 180 days
+    - M15: 30 days
+
+    Full mode:
+    - Daily: from selected start year
+    - H1: 730 days
+    - M15: 60 days
+    """
     ticker = PAIRS[market]["ticker"]
+
+    if scan_speed == "Fast":
+        daily_kwargs = {"period": "18mo"}
+        h1_period = "90d"
+        m15_period = "10d"
+    elif scan_speed == "Balanced":
+        daily_kwargs = {"period": "2y"}
+        h1_period = "180d"
+        m15_period = "30d"
+    else:
+        daily_kwargs = {"start": daily_start}
+        h1_period = "730d"
+        m15_period = "60d"
 
     daily_raw = yf.download(
         ticker,
-        start=daily_start,
         interval="1d",
         progress=False,
         auto_adjust=False,
         threads=False,
+        timeout=20,
+        **daily_kwargs,
     )
     h1_raw = yf.download(
         ticker,
-        period="730d",
+        period=h1_period,
         interval="1h",
         progress=False,
         auto_adjust=False,
         threads=False,
+        timeout=20,
     )
     m15_raw = yf.download(
         ticker,
-        period="60d",
+        period=m15_period,
         interval="15m",
         progress=False,
         auto_adjust=False,
         threads=False,
+        timeout=20,
     )
 
     return clean_data(daily_raw), clean_data(h1_raw), clean_data(m15_raw)
-
 
 def add_cameroon_time(df, start_hour, end_hour):
     df = df.copy()
@@ -719,8 +752,8 @@ def format_telegram_signal_message(strategy, market, direction, entry, sl, tp, r
 # SCANNER
 # =====================================================
 
-def build_strategy_for_market(scan_market, selected_strategy, daily_start, rr_ratio, atr_mult, swing_len, strict_mode, session_start, session_end, enforce_window):
-    d_daily, d_h1, d_m15_raw = load_market_data(scan_market, str(daily_start))
+def build_strategy_for_market(scan_market, selected_strategy, daily_start, rr_ratio, atr_mult, swing_len, strict_mode, session_start, session_end, enforce_window, scan_speed='Fast'):
+    d_daily, d_h1, d_m15_raw = load_market_data(scan_market, str(daily_start), scan_speed=scan_speed)
 
     if d_daily.empty or d_h1.empty or d_m15_raw.empty:
         return d_daily, d_h1, pd.DataFrame(), None, "Not enough data"
@@ -756,7 +789,7 @@ def build_strategy_for_market(scan_market, selected_strategy, daily_start, rr_ra
     return d_daily, d_h1, d_m15, latest_row, None
 
 
-def scan_all_markets(selected_strategy, daily_start, rr_ratio, atr_mult, swing_len, strict_mode, session_start, session_end, enforce_window):
+def scan_all_markets(selected_strategy, daily_start, rr_ratio, atr_mult, swing_len, strict_mode, session_start, session_end, enforce_window, scan_speed='Fast'):
     rows = []
     cache = {}
 
@@ -773,6 +806,7 @@ def scan_all_markets(selected_strategy, daily_start, rr_ratio, atr_mult, swing_l
                 session_start,
                 session_end,
                 enforce_window,
+                scan_speed=scan_speed,
             )
 
             cache[scan_market] = {"daily": d_daily, "h1": d_h1, "m15": d_m15, "latest": latest_row, "error": err}
@@ -1011,7 +1045,7 @@ with st.sidebar:
     st.divider()
     st.subheader("Auto Refresh")
     auto_refresh = st.checkbox("Enable auto-refresh", value=True)
-    refresh_minutes = st.selectbox("Refresh every", [1, 3, 5, 10, 15], index=1)
+    refresh_minutes = st.selectbox("Refresh every", [3, 5, 10, 15], index=1)
 
     if auto_refresh:
         if AUTOREFRESH_AVAILABLE and st_autorefresh is not None:
@@ -1028,21 +1062,6 @@ with st.sidebar:
         st.rerun()
 
 
-# Live prices without st.metric to avoid cloud chunk loading issues
-st.subheader("Live Prices")
-price_rows = []
-for market in SCAN_MARKETS:
-    price, source = get_live_price(market)
-    price_rows.append(
-        {
-            "Market": market,
-            "Live Price": fmt_price(market, price),
-            "Source": source,
-        }
-    )
-st.dataframe(pd.DataFrame(price_rows), use_container_width=True)
-
-
 # Scan all markets
 scanner_df, scanner_cache = scan_all_markets(
     selected_strategy=strategy,
@@ -1054,7 +1073,26 @@ scanner_df, scanner_cache = scan_all_markets(
     session_start=session_start,
     session_end=session_end,
     enforce_window=enforce_session,
+    scan_speed=scan_speed,
 )
+
+
+# Live prices derived from scanner data to avoid extra yfinance requests.
+st.subheader("Live Prices")
+price_rows = []
+for _, row in scanner_df.iterrows():
+    market_name = row.get("Market", "")
+    cache_item = scanner_cache.get(market_name, {})
+    m15_df = cache_item.get("m15", pd.DataFrame())
+    if m15_df is not None and not m15_df.empty and "Close" in m15_df.columns:
+        last_price = m15_df["Close"].dropna().iloc[-1]
+        source = "Latest 15m close"
+    else:
+        last_price = PAIRS.get(market_name, {}).get("default", np.nan)
+        source = "Fallback default"
+    price_rows.append({"Market": market_name, "Live Price": fmt_price(market_name, last_price), "Source": source})
+
+st.dataframe(pd.DataFrame(price_rows), width="stretch")
 
 telegram_statuses = send_scanner_telegram_alerts(
     scanner_df=scanner_df,
@@ -1086,7 +1124,7 @@ else:
             axis=1,
         )
 
-    st.dataframe(color_rows(display_df), use_container_width=True)
+    st.dataframe(color_rows(display_df), width="stretch")
 
 active = scanner_df[scanner_df["Signal"].isin(["BUY", "SELL"])]
 
@@ -1111,7 +1149,7 @@ m15 = cache_item.get("m15", pd.DataFrame())
 if m15 is None or m15.empty:
     st.warning(f"No chart data available for {chart_market}.")
 else:
-    st.plotly_chart(candle_chart(m15.tail(250), f"{chart_market} 15m Chart - {strategy}"), use_container_width=True)
+    st.plotly_chart(candle_chart(m15.tail(250), f"{chart_market} 15m Chart - {strategy}"), width="stretch")
 
     setups = m15[m15["Signal"].isin(["BUY", "SELL"])].dropna(subset=["Entry", "SL", "TP"]).tail(30)
     st.subheader("Latest Valid Setups")
@@ -1135,6 +1173,6 @@ else:
             "Reason",
         ]
         show_cols = [col for col in show_cols if col in setups.columns]
-        st.dataframe(color_rows(setups[show_cols]), use_container_width=True)
+        st.dataframe(color_rows(setups[show_cols]), width="stretch")
 
 st.warning("Signals are for educational and monitoring purposes only. Confirm broker price, spread, news risk, and your own trading plan before entering any trade.")
