@@ -979,6 +979,9 @@ def candle_chart(df, title):
 st.title("📡 Telegram Trading Signal Scanner")
 st.caption("Streamlit Cloud friendly scanner for EURUSD, XAUUSD, and BTCUSD. No MT5. No trade execution. Telegram signals only.")
 
+# Default for Streamlit Cloud safety. Sidebar can override this.
+scan_speed = "Fast"
+
 with st.sidebar:
     st.header("Scanner Controls")
 
@@ -989,6 +992,13 @@ with st.sidebar:
     )
 
     chart_market = st.selectbox("Chart market", SCAN_MARKETS, index=0)
+    scan_speed = st.selectbox("Scan speed", ["Fast", "Balanced", "Full"], index=0)
+    if scan_speed == "Fast":
+        st.caption("Fast mode: best for Streamlit Cloud.")
+    elif scan_speed == "Balanced":
+        st.caption("Balanced mode: more data, slower scan.")
+    else:
+        st.caption("Full mode: heaviest scan. Use only when needed.")
     data_start_year = st.selectbox("Daily data start year", [2018, 2019, 2020, 2021, 2022, 2023], index=2)
     daily_start = f"{data_start_year}-01-01"
 

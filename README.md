@@ -1,41 +1,20 @@
-# Telegram Trading Signal Scanner
+# Telegram Signal Scanner - NameError Fixed
 
-This is a Streamlit Cloud friendly app.
+## Fixed
 
-## What it does
+This version fixes:
 
-- Scans only:
-  - EURUSD
-  - XAUUSD
-  - BTCUSD
-- Supports:
-  - SMC Market Structure
-  - FX 15m Momentum
-- Sends BUY/SELL alerts to Telegram
-- Uses duplicate protection so the same signal is not sent repeatedly
-- Includes auto-refresh
-- No MetaTrader 5
-- No MT5 trade execution
-- No manual risk calculator
-- No trade ticket
-- No journal
-- No performance tab
+NameError: name 'scan_speed' is not defined
 
-## Streamlit Cloud Secrets
+## What changed
 
-In Streamlit Cloud, add these secrets:
+- Added a safe default: scan_speed = "Fast"
+- Added/confirmed the Scan Speed selector in the sidebar
+- Passed scan_speed properly through the scanner functions
+- Kept the Streamlit Cloud fast data windows
 
-TELEGRAM_BOT_TOKEN = "your_bot_token"
-TELEGRAM_CHAT_ID = "your_chat_id"
+## Recommended settings
 
-## Run locally
-
-streamlit run app.py
-
-## Deploy files
-
-Upload these files to GitHub:
-
-- app.py
-- requirements.txt
-- README.md
+- Scan speed: Fast
+- Refresh every: 5 minutes
+- Strategy: FX 15m Momentum first
