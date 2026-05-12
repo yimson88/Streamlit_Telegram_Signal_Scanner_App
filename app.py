@@ -35,6 +35,7 @@ st.set_page_config(
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 TELEGRAM_SENT_LOG_FILE = DATA_DIR / "telegram_sent_signals.csv"
+ACTIVE_SIGNAL_STATE_FILE = DATA_DIR / "active_signal_state.csv"
 
 PAIRS = {
     "EURUSD": {
@@ -174,6 +175,235 @@ def already_sent_exact_signal(signal_id):
         return False
     return str(signal_id) in set(log["Signal_ID"].astype(str))
 
+
+# =====================================================
+# ACTIVE SIGNAL STATE: ONE OPEN SIGNAL PER PAIR
+# =====================================================
+
+ACTIVE_SIGNAL_COLUMNS = [
+    "Market",
+    "Signal_ID",
+    "Strategy",
+    "Direction",
+    "Entry",
+    "SL",
+    "TP",
+    "Opened_At",
+    "Opened_Candle_Date",
+    "Status",
+    "Closed_At",
+    "Close_Reason",
+    "Close_Price",
+]
+
+
+def load_active_signal_state():
+    if ACTIVE_SIGNAL_STATE_FILE.exists():
+        try:
+            df = pd.read_csv(ACTIVE_SIGNAL_STATE_FILE)
+            for col in ACTIVE_SIGNAL_COLUMNS:
+                if col not in df.columns:
+                    df[col] = np.nan
+            return df[ACTIVE_SIGNAL_COLUMNS]
+        except Exception:
+            return pd.DataFrame(columns=ACTIVE_SIGNAL_COLUMNS)
+
+    return pd.DataFrame(columns=ACTIVE_SIGNAL_COLUMNS)
+
+
+def save_active_signal_state(df):
+    df = df.copy()
+    for col in ACTIVE_SIGNAL_COLUMNS:
+        if col not in df.columns:
+            df[col] = np.nan
+    df[ACTIVE_SIGNAL_COLUMNS].to_csv(ACTIVE_SIGNAL_STATE_FILE, index=False)
+
+
+def clear_active_signal_state():
+    if ACTIVE_SIGNAL_STATE_FILE.exists():
+        ACTIVE_SIGNAL_STATE_FILE.unlink()
+
+
+def get_open_active_signal(market):
+    df = load_active_signal_state()
+
+    if df.empty:
+        return None
+
+    open_rows = df[
+        (df["Market"].astype(str) == str(market))
+        & (df["Status"].astype(str) == "OPEN")
+    ]
+
+    if open_rows.empty:
+        return None
+
+    return open_rows.iloc[-1].to_dict()
+
+
+def active_signal_blocks_new_signal(market):
+    active = get_open_active_signal(market)
+
+    if active is None:
+        return False, ""
+
+    return True, (
+        f"Previous {active.get('Direction')} signal is still OPEN for {market}. "
+        f"Waiting for TP {active.get('TP')} or SL {active.get('SL')} before allowing a new signal."
+    )
+
+
+def record_active_signal(signal_id, strategy, market, direction, entry, sl, tp, opened_candle_date):
+    """
+    Lock this market after a Telegram signal is successfully sent.
+    The market is unlocked only when TP or SL is detected.
+    """
+    df = load_active_signal_state()
+
+    already_open = df[
+        (df["Market"].astype(str) == str(market))
+        & (df["Status"].astype(str) == "OPEN")
+    ]
+
+    if not already_open.empty:
+        return
+
+    new_row = pd.DataFrame([{
+        "Market": market,
+        "Signal_ID": signal_id,
+        "Strategy": strategy,
+        "Direction": direction,
+        "Entry": float(entry),
+        "SL": float(sl),
+        "TP": float(tp),
+        "Opened_At": safe_timestamp(),
+        "Opened_Candle_Date": str(opened_candle_date),
+        "Status": "OPEN",
+        "Closed_At": "",
+        "Close_Reason": "",
+        "Close_Price": np.nan,
+    }])
+
+    df = pd.concat([df, new_row], ignore_index=True)
+    save_active_signal_state(df)
+
+
+def evaluate_signal_outcome_from_candles(direction, sl, tp, candles):
+    """
+    Checks whether a previous signal has hit TP or SL.
+
+    Conservative rule:
+    If TP and SL are touched in the same candle, SL is counted first.
+    """
+    if candles is None or candles.empty:
+        return None, None, None
+
+    for _, candle in candles.iterrows():
+        high = pd.to_numeric(candle.get("High", np.nan), errors="coerce")
+        low = pd.to_numeric(candle.get("Low", np.nan), errors="coerce")
+
+        if pd.isna(high) or pd.isna(low):
+            continue
+
+        if direction == "BUY":
+            if float(low) <= float(sl):
+                return "SL", float(sl), candle.get("Date", "")
+            if float(high) >= float(tp):
+                return "TP", float(tp), candle.get("Date", "")
+
+        if direction == "SELL":
+            if float(high) >= float(sl):
+                return "SL", float(sl), candle.get("Date", "")
+            if float(low) <= float(tp):
+                return "TP", float(tp), candle.get("Date", "")
+
+    return None, None, None
+
+
+def update_open_signal_outcomes(scanner_cache):
+    """
+    Called after fresh market data loads.
+    If an open signal hits TP or SL, it is closed and the pair is unlocked.
+    """
+    df = load_active_signal_state()
+    statuses = []
+
+    if df.empty:
+        return statuses
+
+    changed = False
+
+    for idx, row in df[df["Status"].astype(str) == "OPEN"].iterrows():
+        market = str(row.get("Market", ""))
+        direction = str(row.get("Direction", ""))
+        sl = row.get("SL", np.nan)
+        tp = row.get("TP", np.nan)
+
+        cache_item = scanner_cache.get(market, {}) if isinstance(scanner_cache, dict) else {}
+        m15 = cache_item.get("m15", pd.DataFrame())
+
+        if m15 is None or m15.empty:
+            continue
+
+        candles = m15.copy()
+        candles["Date"] = pd.to_datetime(candles["Date"], errors="coerce")
+
+        opened_date = pd.to_datetime(row.get("Opened_Candle_Date", ""), errors="coerce")
+
+        if pd.notna(opened_date):
+            candles_to_check = candles[candles["Date"] >= opened_date].copy()
+        else:
+            candles_to_check = candles.tail(20).copy()
+
+        if candles_to_check.empty:
+            candles_to_check = candles.tail(20).copy()
+
+        outcome, close_price, close_time = evaluate_signal_outcome_from_candles(
+            direction=direction,
+            sl=sl,
+            tp=tp,
+            candles=candles_to_check,
+        )
+
+        if outcome in ["TP", "SL"]:
+            df.loc[idx, "Status"] = outcome
+            df.loc[idx, "Closed_At"] = safe_timestamp()
+            df.loc[idx, "Close_Reason"] = "Take Profit hit" if outcome == "TP" else "Stop Loss hit"
+            df.loc[idx, "Close_Price"] = close_price
+            changed = True
+            statuses.append(
+                f"{market}: previous {direction} signal closed by {outcome} at {close_price}. New signal is now allowed."
+            )
+
+    if changed:
+        save_active_signal_state(df)
+
+    return statuses
+
+
+def apply_active_signal_lock(scanner_df):
+    """
+    Converts BUY/SELL scanner rows to NEUTRAL when the pair already has
+    an open signal waiting for TP/SL.
+    """
+    if scanner_df is None or scanner_df.empty:
+        return scanner_df
+
+    df = scanner_df.copy()
+
+    for idx, row in df.iterrows():
+        market = row.get("Market", "")
+
+        blocked, message = active_signal_blocks_new_signal(market)
+
+        if blocked and row.get("Signal") in ["BUY", "SELL"]:
+            df.loc[idx, "Signal"] = "NEUTRAL"
+            df.loc[idx, "Direction"] = "NEUTRAL"
+            df.loc[idx, "Reason"] = message
+
+        df.loc[idx, "Active_Signal_Status"] = "OPEN" if blocked else "NONE"
+
+    return df
 
 
 # =====================================================
@@ -876,6 +1106,7 @@ def scan_all_markets(selected_strategy, daily_start, rr_ratio, atr_mult, swing_l
                         "Strategy": selected_strategy,
                         "Signal": "NEUTRAL",
                         "Direction": "NEUTRAL",
+                        "Signal_Date": "N/A",
                         "Entry": np.nan,
                         "SL": np.nan,
                         "TP": np.nan,
@@ -914,6 +1145,7 @@ def scan_all_markets(selected_strategy, daily_start, rr_ratio, atr_mult, swing_l
                     "Strategy": selected_strategy,
                     "Signal": signal_value,
                     "Direction": direction_value,
+                    "Signal_Date": str(latest_row.get("Date", "")),
                     "Entry": latest_row.get("Entry", np.nan),
                     "SL": latest_row.get("SL", np.nan),
                     "TP": latest_row.get("TP", np.nan),
@@ -934,6 +1166,7 @@ def scan_all_markets(selected_strategy, daily_start, rr_ratio, atr_mult, swing_l
                     "Strategy": selected_strategy,
                     "Signal": "NEUTRAL",
                     "Direction": "NEUTRAL",
+                    "Signal_Date": "N/A",
                     "Entry": np.nan,
                     "SL": np.nan,
                     "TP": np.nan,
@@ -949,7 +1182,19 @@ def scan_all_markets(selected_strategy, daily_start, rr_ratio, atr_mult, swing_l
     return pd.DataFrame(rows), cache
 
 
-def send_scanner_telegram_alerts(scanner_df, strategy, risk_percent, rr_label, bot_token, chat_id, enable_telegram, auto_send, cooldown_minutes, block_closed_markets=True, max_signal_age_minutes=90):
+def send_scanner_telegram_alerts(
+    scanner_df,
+    strategy,
+    risk_percent,
+    rr_label,
+    bot_token,
+    chat_id,
+    enable_telegram,
+    auto_send,
+    cooldown_minutes,
+    block_closed_markets=True,
+    max_signal_age_minutes=90,
+):
     statuses = []
 
     if not enable_telegram or not auto_send:
@@ -970,6 +1215,13 @@ def send_scanner_telegram_alerts(scanner_df, strategy, risk_percent, rr_label, b
         sl = row["SL"]
         tp = row["TP"]
         cameroon_time = str(row.get("Cameroon_Time", ""))
+        signal_date = str(row.get("Signal_Date", ""))
+
+        # Main protection: one active signal per pair until TP/SL is hit.
+        blocked, block_message = active_signal_blocks_new_signal(market)
+        if blocked:
+            statuses.append(f"{market}: {block_message}")
+            continue
 
         if pd.isna(entry) or pd.isna(sl) or pd.isna(tp):
             statuses.append(f"{market}: skipped because Entry/SL/TP is missing.")
@@ -1016,6 +1268,20 @@ def send_scanner_telegram_alerts(scanner_df, strategy, risk_percent, rr_label, b
 
         if ok:
             save_telegram_sent_signal(signal_key, signal_id, strategy, market, direction, response)
+
+            # Lock the pair until TP or SL is hit.
+            record_active_signal(
+                signal_id=signal_id,
+                strategy=strategy,
+                market=market,
+                direction=direction,
+                entry=entry,
+                sl=sl,
+                tp=tp,
+                opened_candle_date=signal_date,
+            )
+
+            statuses.append(f"{market}: signal locked as OPEN until TP or SL is hit.")
 
         statuses.append(f"{market}: {response}")
 
@@ -1157,6 +1423,10 @@ with st.sidebar:
         clear_telegram_sent_log()
         st.success("Telegram sent-signal log cleared.")
 
+    if st.button("Clear active/open signal state"):
+        clear_active_signal_state()
+        st.success("Active/open signal state cleared.")
+
     st.divider()
     st.subheader("Auto Refresh")
     auto_refresh = st.checkbox("Enable auto-refresh", value=True)
@@ -1192,6 +1462,9 @@ scanner_df, scanner_cache = scan_all_markets(
     block_closed_markets=block_closed_markets,
     max_signal_age_minutes=max_signal_age_minutes,
 )
+
+active_signal_statuses = update_open_signal_outcomes(scanner_cache)
+scanner_df = apply_active_signal_lock(scanner_df)
 
 
 # Live prices derived from scanner data to avoid extra yfinance requests.
@@ -1229,7 +1502,7 @@ telegram_statuses = send_scanner_telegram_alerts(
 # Dashboard
 st.subheader("All-Pair Signal Scanner")
 st.caption(
-    f"The app scans EURUSD, XAUUSD, and BTCUSD after every refresh. Minimum interval between alerts: {signal_interval_label}. Closed-market and stale-candle filters are active."
+    f"The app scans EURUSD, XAUUSD, and BTCUSD after every refresh. A pair gives a new signal only after the previous signal hits TP or SL."
 )
 
 if scanner_df.empty:
@@ -1252,10 +1525,22 @@ if active.empty:
 else:
     st.success(f"Active signals found: {len(active)}")
 
+if active_signal_statuses:
+    st.subheader("Active Signal Status")
+    for status in active_signal_statuses:
+        st.success(status)
+
 if telegram_statuses:
     st.subheader("Telegram Status")
     for status in telegram_statuses:
         st.info(status)
+
+open_state = load_active_signal_state()
+open_state = open_state[open_state["Status"].astype(str) == "OPEN"] if not open_state.empty else open_state
+if not open_state.empty:
+    st.subheader("Open Signal State")
+    st.caption("New signals are blocked for these pairs until TP or SL is hit.")
+    st.dataframe(open_state, width="stretch")
 
 st.divider()
 
